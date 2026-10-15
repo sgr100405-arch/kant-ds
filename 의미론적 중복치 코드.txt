@@ -1,0 +1,204 @@
+"""STEP 4 supplementary audit: exact, partial, near, geometric duplicate candidates.
+
+Does not remove any rows or alter the existing Train/Valid/Test split.
+Run: python STEP4_semantic_duplicate_audit.py
+Input: steel_plates_faults.csv, outputs_preprocessing/10_split_assignment_audit.csv
+"""
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+FAULT_COLS = ["Pastry", "Z_Scratch", "K_Scatch", "Stains", "Dirtiness", "Bumps", "Other_Faults"]
+CORE_8 = ["Pixels_Areas", "X_Perimeter", "Y_Perimeter", "Sum_of_Luminosity",
+          "Minimum_of_Luminosity", "Maximum_of_Luminosity", "Steel_Plate_Thickness", "TypeOfSteel_A300"]
+
+
+def run_audit(df: pd.DataFrame, split_map: pd.Series, out_dir: Path):
+    """Use original row indices for split assignment; produce candidate pair CSVs and report."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    d = df.copy()
+    if "Fault" not in d:
+        d["Fault"] = d[FAULT_COLS].idxmax(axis=1)
+    feature_cols = [c for c in d.columns if c not in FAULT_COLS + ["Fault"]]
+    if len(feature_cols) != 27:
+        raise ValueError(f"Expected 27 features, got {len(feature_cols)}")
+    n = len(d)
+    if not d.index.is_unique or split_map.reindex(d.index).isna().any():
+        raise ValueError("Missing or duplicate original row indices in split assignment")
+    splits = split_map.reindex(d.index).astype(str).to_numpy()
+    faults = d.Fault.to_numpy()
+    i, j = np.triu_indices(n, k=1)
+
+    def v(col):
+        return d[col].to_numpy(dtype=float)
+
+    def reldiff(col):
+        arr = v(col)
+        return np.abs(arr[i] - arr[j]) / np.maximum(1, np.maximum(np.abs(arr[i]), np.abs(arr[j])))
+
+    def abdiff(col):
+        arr = v(col)
+        return np.abs(arr[i] - arr[j])
+
+    # Conservative, documented *screening rule*, not a proof of duplicate identity.
+    near_mask = (
+        (v("TypeOfSteel_A300")[i] == v("TypeOfSteel_A300")[j])
+        & (v("Steel_Plate_Thickness")[i] == v("Steel_Plate_Thickness")[j])
+        & (reldiff("Pixels_Areas") <= 0.02)
+        & (reldiff("X_Perimeter") <= 0.02)
+        & (reldiff("Y_Perimeter") <= 0.02)
+        & (abdiff("Minimum_of_Luminosity") <= 5)
+        & (abdiff("Maximum_of_Luminosity") <= 5)
+    )
+    # Bounding-box IoU from positions only. This is not a reliable identity test
+    # across steel coils/plates if coordinates reset between acquisitions.
+    left = np.maximum(v("X_Minimum")[i], v("X_Minimum")[j])
+    right = np.minimum(v("X_Maximum")[i], v("X_Maximum")[j])
+    bottom = np.maximum(v("Y_Minimum")[i], v("Y_Minimum")[j])
+    top = np.minimum(v("Y_Maximum")[i], v("Y_Maximum")[j])
+    intersection = np.maximum(right - left, 0) * np.maximum(top - bottom, 0)
+    box_area = np.maximum(v("X_Maximum") - v("X_Minimum"), 0) * np.maximum(v("Y_Maximum") - v("Y_Minimum"), 0)
+    union = box_area[i] + box_area[j] - intersection
+    iou = np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
+    overlap_mask = iou >= 0.5
+
+    def pair_table(mask):
+        p = np.where(mask)[0]
+        out = pd.DataFrame({
+            "row_a_1based": d.index.to_numpy()[i[p]] + 1,
+            "row_b_1based": d.index.to_numpy()[j[p]] + 1,
+            "split_a": splits[i[p]], "split_b": splits[j[p]],
+            "class_a": faults[i[p]], "class_b": faults[j[p]],
+            "same_class": faults[i[p]] == faults[j[p]],
+            "cross_split": splits[i[p]] != splits[j[p]],
+            "area_relative_diff": reldiff("Pixels_Areas")[p],
+            "x_perimeter_relative_diff": reldiff("X_Perimeter")[p],
+            "y_perimeter_relative_diff": reldiff("Y_Perimeter")[p],
+            "min_luminosity_abs_diff": abdiff("Minimum_of_Luminosity")[p],
+            "max_luminosity_abs_diff": abdiff("Maximum_of_Luminosity")[p],
+            "box_iou": iou[p],
+        })
+        return out
+
+    # Exactly matching fundamental measurements while allowing other fields to differ
+    core_group = d.duplicated(CORE_8, keep=False)
+    core_pairs = pair_table(np.zeros_like(near_mask, dtype=bool))
+    if core_group.any():
+        groups = d.loc[core_group].groupby(CORE_8, dropna=False, sort=False)
+        row_pairs = []
+        for _, group in groups:
+            idx = group.index.to_numpy()
+            for k in range(len(idx)):
+                for z in range(k + 1, len(idx)):
+                    row_pairs.append((int(idx[k]), int(idx[z])))
+        if row_pairs:
+            core_pair_mask = np.zeros_like(near_mask)
+            # Translate original index -> positional index only once
+            pos = {int(index): p for p, index in enumerate(d.index)}
+            selected = {(min(pos[a], pos[b]), max(pos[a], pos[b])) for a, b in row_pairs}
+            core_pair_mask = np.fromiter(((int(a), int(b)) in selected for a, b in zip(i, j)), bool, count=len(i))
+            core_pairs = pair_table(core_pair_mask)
+
+    near_pairs = pair_table(near_mask)
+    overlap_pairs = pair_table(overlap_mask).sort_values("box_iou", ascending=False)
+    core_pairs.to_csv(out_dir / "11_core_measurement_matching_pairs.csv", index=False, encoding="utf-8-sig")
+    near_pairs.to_csv(out_dir / "12_near_duplicate_candidate_pairs.csv", index=False, encoding="utf-8-sig")
+    overlap_pairs.to_csv(out_dir / "13_overlapping_bounding_boxes.csv", index=False, encoding="utf-8-sig")
+
+    def n_dup(cols):
+        return int(d.duplicated(cols).sum())
+
+    summary = {
+        "original_rows": n,
+        "full_duplicates": n_dup(feature_cols + ["Fault"]),
+        "input_exact_duplicates": n_dup(feature_cols),
+        "input_exact_duplicates_ignoring_XY": n_dup([c for c in feature_cols if c not in ["X_Minimum", "X_Maximum", "Y_Minimum", "Y_Maximum"]]),
+        "core8_matching_pairs": len(core_pairs),
+        "near_candidate_pairs": len(near_pairs),
+        "near_candidate_involved_rows": len(set(near_pairs.row_a_1based) | set(near_pairs.row_b_1based)),
+        "near_candidate_cross_split_pairs": int(near_pairs.cross_split.sum()),
+        "near_candidate_different_label_pairs": int((~near_pairs.same_class).sum()),
+        "bbox_iou_ge_0_5_pairs": len(overlap_pairs),
+        "group_identifier_available": False,
+    }
+    summary_df = pd.DataFrame([summary])
+    summary_df.to_csv(out_dir / "14_semantic_duplicate_audit_summary.csv", index=False, encoding="utf-8-sig")
+
+    transition = {"Train-Train": 0, "Train-Valid": 0, "Train-Test": 0, "Valid-Valid": 0, "Valid-Test": 0, "Test-Test": 0}
+    order = {"Train": 0, "Valid": 1, "Test": 2}
+    for _, row in near_pairs.iterrows():
+        ss = sorted([row.split_a, row.split_b], key=lambda a: order.get(a, 9))
+        transition["-".join(ss)] = transition.get("-".join(ss), 0) + 1
+    trans_df = pd.DataFrame([{"split_relationship": k, "candidate_pairs": v} for k, v in transition.items()])
+    trans_df.to_csv(out_dir / "15_near_duplicate_pairs_by_split.csv", index=False, encoding="utf-8-sig")
+
+    # Redundancy of *columns* is conceptually different from duplicate *rows*.
+    derived = {
+        "A300_plus_A400_equals_1": int((d["TypeOfSteel_A300"] + d["TypeOfSteel_A400"] == 1).sum()),
+        "LogOfAreas_matches_log10_area_within_0.00011": int((np.abs(d["LogOfAreas"] - np.log10(d["Pixels_Areas"])) < .00011).sum()),
+        "Log_X_matches_log10_width_within_0.00011": int((np.abs(d["Log_X_Index"] - np.log10(d["X_Maximum"] - d["X_Minimum"])) < .00011).sum()),
+        "Log_Y_matches_log10_height_within_0.00011": int((np.abs(d["Log_Y_Index"] - np.log10(d["Y_Maximum"] - d["Y_Minimum"])) < .00011).sum()),
+    }
+    pd.DataFrame([derived]).to_csv(out_dir / "16_derived_feature_redundancy_checks.csv", index=False, encoding="utf-8-sig")
+
+    lines = [
+        "# STEP 4 – 의미론적 중복 의심 관측치 재검증 보고서", "",
+        "> 이 문서는 원본 데이터를 삭제하거나 Train/Valid/Test를 재분할하지 않고, 추가 점검한 결과입니다.", "",
+        f"- 전체 표본: **{n:,}건**",
+        f"- 27개 입력+정답 완전 중복: **{summary['full_duplicates']}건**",
+        f"- 27개 입력만 완전 일치: **{summary['input_exact_duplicates']}건**",
+        f"- X/Y 위치 4개 열을 제외한 23개 입력 완전 일치: **{summary['input_exact_duplicates_ignoring_XY']}건**",
+        f"- 핵심 측정값 8개가 완전히 같은 관측치: **{len(core_pairs)}쌍**",
+        f"- 별도 허용오차 규칙으로 찾은 유사 관측치: **{len(near_pairs)}쌍** (관계된 행 {summary['near_candidate_involved_rows']}건)",
+        f"- 그중 분할 집합이 서로 다른 후보: **{summary['near_candidate_cross_split_pairs']}쌍**",
+        f"- 그중 결함 클래스가 다른 후보: **{summary['near_candidate_different_label_pairs']}쌍**",
+        f"- 좌표 경계상자 IoU >= 0.5: **{len(overlap_pairs)}쌍**", "",
+        "## 유사 관측치 탐색 조건 (연구자 정의, 확정 중복 기준 아님)", "",
+        "동일 강종(A300 여부), 동일 두께, 결함 면적의 상대차 <= 2%, X 둘레 상대차 <= 2%, Y 둘레 상대차 <= 2%, 최솟값 밝기와 최댓값 밝기 차가 각각 <= 5인 두 관측치를 후보로 표시했다.",
+        "상대차는 |a-b|/max(1, |a|, |b|)로 정의했다. 이 기준은 스크리닝을 위한 임의 허용오차로, 실제 중복이나 오표기를 판정하지 않는다.", "",
+        "## 분할 간 후보", "",
+        "| 분할 관계 | 후보 쌍 수 |", "|---|---:|",
+    ]
+    for k, value in transition.items():
+        lines.append(f"| {k} | {value} |")
+    lines += [
+        "", "## 주요 사례", "",
+        "- 원본 **1,776–1,777행**: Other_Faults, 27개 입력 특성 중 23개 값 동일, 경계상자 IoU 0.52, 두 행의 분할은 Test/Valid. 면적·둘레·밝기 합계 동일. 원본 이미지·코일 ID가 없어 같은 결함인지 확정 불가.",
+        "- 원본 **530–679행**: K_Scatch, 경계상자 IoU 약 0.7265, 양쪽 모두 Train. 둘레·밝기·컨베이어 길이가 달라 같은 결함 여부를 알 수 없음.",
+        "- 원본 **251–1409행**: 허용오차 기준상 유사하지만 정답 Z_Scratch/Other_Faults가 다르고 실제 좌표는 크게 다름. 이를 정답 충돌이나 오표기로 판정하지 않아야 함.", "",
+        "## 중복 행과 중복 정보(변수)의 구별", "",
+        f"- A300/A400 이진변수 합계가 1인 행: {derived['A300_plus_A400_equals_1']:,}/{n:,}건",
+        f"- LogOfAreas ≈ log10(Pixels_Areas): {derived['LogOfAreas_matches_log10_area_within_0.00011']:,}/{n:,}건",
+        f"- Log_X_Index ≈ log10(X_Maximum-X_Minimum): {derived['Log_X_matches_log10_width_within_0.00011']:,}/{n:,}건",
+        f"- Log_Y_Index ≈ log10(Y_Maximum-Y_Minimum): {derived['Log_Y_matches_log10_height_within_0.00011']:,}/{n:,}건",
+        "이는 변수 간 파생·중복 정보이며 동일한 *행*이라는 뜻은 아니다. EDA 이후 별도의 변수 선택 실험으로 평가할 수 있다.", "",
+        "## 데이터 처리 결정", "",
+        "1. **추가 삭제 0건**: 원본 이미지·강판 ID·코일/배치 정보가 없어 별개의 유사 결함인지 중복 채록인지 식별 불가.",
+        "2. 현재 랜덤 층화 분할은 유사한 관측치의 Train/Valid/Test 동시 포함 가능성을 배제하지 못함. 완전 동일 27개 입력의 분할 교차는 없음.",
+        "3. 가능하다면 코일/배치/이미지/생산시각 ID로 동일 결함 여부를 원천 확인한 뒤, 동일 원천 단위로 **Group 기반 분할**을 실시한다.",
+        "4. 의심 쌍을 유사도만으로 결합하거나 정답을 통일하면 실제 다른 결함을 삭제·변경할 수 있으므로 금지한다.",
+        "5. 보고서 문구는 '완전 중복 0건, 의미론적 중복 여부 미확정(후보 발견)'으로 기술한다.",
+    ]
+    (out_dir / "STEP4_의미론적중복_추가검증_보고서.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary, near_pairs, overlap_pairs, core_pairs
+
+
+# 원본 행 번호를 보존한 분할 맵을 이용해 같은 결함일 가능성이 있는 관측치 탐색
+split_map_semantic = pd.concat([
+    pd.Series(name, index=chunk.index, name="split") for name, chunk in parts.items()
+])
+audit_summary, semantic_near_pairs, geometric_overlap_pairs, core_matching_pairs = run_audit(
+    df_clean, split_map_semantic, OUT_DIR
+)
+print("[완전 중복]", audit_summary["full_duplicates"], "건")
+print("[핵심 측정값 8개 일치]", audit_summary["core8_matching_pairs"], "쌍")
+print("[유사 결함 후보]", audit_summary["near_candidate_pairs"], "쌍")
+print("[유사 후보 중 서로 다른 분할에 위치]", audit_summary["near_candidate_cross_split_pairs"], "쌍")
+print("[IoU 0.5 이상]", audit_summary["bbox_iou_ge_0_5_pairs"], "쌍")
+print("[주의] 의미론적으로 동일한 실제 결함인지 확인하려면 이미지/생산 ID가 필요합니다. 후보를 삭제하지 않았습니다.")
+print("\n핵심 측정값이 일치하는 의심 쌍:")
+display(core_matching_pairs)
+print("\n공간적으로 겹치는 의심 쌍:")
+display(geometric_overlap_pairs)
+print("\n유사 결함 후보 중 분할 간 공유된 사례(앞 12쌍):")
+display(semantic_near_pairs.loc[semantic_near_pairs.cross_split].head(12))
